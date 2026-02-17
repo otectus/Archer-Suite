@@ -1,5 +1,7 @@
 # Archer Compatibility Suite (Linuwu-DAMX Installer v2.0)
 
+Have an Acer laptop running Arch Linux? You're in the right place.
+
 A comprehensive, modular compatibility suite for Acer laptops running Arch Linux and Arch-based distributions. Originally built for Linuwu-Sense and DAMX (Div Acer Manager Max), the installer now provides hardware-aware detection and targeted fixes for a broad range of Acer laptop issues on Linux.
 
 ## Supported Hardware
