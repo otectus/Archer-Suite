@@ -1,104 +1,343 @@
 #!/usr/bin/env fish
-# Linuwu-DAMX Unified One-Click Setup
-# Targeted for Arch Linux / CachyOS (Acer Laptops)
+# Linuwu-DAMX Installer v2.0 (Fish)
+# Comprehensive Acer laptop compatibility suite for Arch Linux
+# Supports: Nitro, Predator, Helios, Triton, Swift, Aspire, and more
 
-set REPO_DRIVER "https://github.com/0x7375646F/Linuwu-Sense.git"
-set REPO_APP "PXDiv/Div-Acer-Manager-Max"
-set INSTALL_DIR "$HOME/.local/share/damx"
-set MODULE_NAME "linuwu_sense"
+# --- Resolve script directory ---
+set -g SCRIPT_DIR (realpath (dirname (status filename)))
 
-function log
-    echo (set_color cyan)">>> "(set_color normal)$argv
+# --- Source libraries ---
+source "$SCRIPT_DIR/lib/utils.fish"
+source "$SCRIPT_DIR/lib/detect.fish"
+source "$SCRIPT_DIR/lib/manifest.fish"
+
+# --- Module registry ---
+set -g MODULE_IDS core-damx battery gpu touchpad audio wifi power thermal
+set -g MODULE_LABELS \
+    "DAMX Fan & RGB Control" \
+    "Battery Charge Limit (80%)" \
+    "GPU Switching (EnvyControl)" \
+    "Touchpad Fix (I2C HID)" \
+    "Audio Fix (SOF/ALSA)" \
+    "WiFi/Bluetooth Troubleshooting" \
+    "Power Management (TLP)" \
+    "Kernel Thermal Profiles"
+set -g MODULE_SELECTED 0 0 0 0 0 0 0 0
+set -g INSTALLED_FILES
+set -g INSTALLED_DKMS
+set -g INSTALLED_PACKAGES
+
+# --- CLI argument parsing ---
+set -g SELECT_ALL_RECOMMENDED 0
+set -g EXPLICIT_MODULES ""
+set -g SHOW_HELP 0
+set -g SHOW_VERSION 0
+
+function parse_args
+    set -l i 1
+    while test $i -le (count $argv)
+        switch $argv[$i]
+            case --all
+                set -g SELECT_ALL_RECOMMENDED 1
+            case --modules
+                set i (math $i + 1)
+                set -g EXPLICIT_MODULES $argv[$i]
+            case --no-confirm
+                set -g NO_CONFIRM 1
+            case --dry-run
+                set -g DRY_RUN 1
+            case --help -h
+                set -g SHOW_HELP 1
+            case --version -v
+                set -g SHOW_VERSION 1
+            case '*'
+                error "Unknown option: $argv[$i]. Use --help for usage."
+        end
+        set i (math $i + 1)
+    end
 end
 
-function error
-    echo (set_color red)"\u274c "(set_color normal)$argv
-    exit 1
+function show_help
+    echo "Linuwu-DAMX Installer v$INSTALLER_VERSION"
+    echo ""
+    echo "Usage: ./setup.fish [OPTIONS]"
+    echo ""
+    echo "Options:"
+    echo "  --all            Install all recommended modules (non-interactive)"
+    echo "  --modules LIST   Comma-separated list of modules to install"
+    echo "                   Available: $MODULE_IDS"
+    echo "  --no-confirm     Skip all confirmation prompts"
+    echo "  --dry-run        Show what would be done without making changes"
+    echo "  --help, -h       Show this help message"
+    echo "  --version, -v    Show version"
+    echo ""
+    echo "Interactive mode (default): Detects hardware and presents a menu."
 end
 
-# 1. Compatibility Check
-set ACER_MODEL (cat /sys/devices/virtual/dmi/id/product_name)
-log "Detected Acer model: $ACER_MODEL"
-if not string match -rq "Nitro|Predator|Helios|Triton" "$ACER_MODEL"
-    echo (set_color yellow)"\u26a0 Warning: Model not explicitly supported. Proceeding anyway..."(set_color normal)
+# --- Menu display and interaction ---
+function is_in_list
+    set -l item $argv[1]
+    set -l list $argv[2..-1]
+    for entry in $list
+        if test "$entry" = "$item"
+            return 0
+        end
+    end
+    return 1
 end
 
-# 2. Dependency Installation
-log "Installing system dependencies..."
-set KERNEL_HEADERS "linux-headers"
-if string match -q "*cachyos*" (uname -r)
-    set KERNEL_HEADERS "linux-cachyos-headers"
+function display_menu
+    echo ""
+    echo (set_color --bold)"=== Linuwu-DAMX Installer v$INSTALLER_VERSION ==="(set_color normal)
+    echo ""
+    print_hw_summary
+    echo ""
+    echo (set_color --bold)"Select modules to install:"(set_color normal)
+
+    for i in (seq (count $MODULE_IDS))
+        set -l id $MODULE_IDS[$i]
+        set -l label $MODULE_LABELS[$i]
+        set -l marker " "
+        set -l tag ""
+
+        # Determine tag
+        if is_in_list "$id" $RECOMMENDED_MODULES
+            set tag (set_color green)"[RECOMMENDED]"(set_color normal)
+        else if is_in_list "$id" $OPTIONAL_MODULES
+            set tag "[OPTIONAL]"
+        end
+
+        # Check conflicts
+        if test "$id" = "thermal"; and test "$MODULE_SELECTED[1]" = 1
+            set tag (set_color red)"[CONFLICTS WITH #1]"(set_color normal)
+        end
+        if test "$id" = "core-damx"; and test "$MODULE_SELECTED[8]" = 1
+            set tag (set_color red)"[CONFLICTS WITH #8]"(set_color normal)
+        end
+
+        # Selection marker
+        if test "$MODULE_SELECTED[$i]" = 1
+            set marker (set_color green)"*"(set_color normal)
+        end
+
+        printf "  [%s] %d. %-40s %s\n" "$marker" $i "$label" "$tag"
+    end
+
+    echo ""
+    echo "Toggle: Enter number (1-"(count $MODULE_IDS)") | a=all recommended | n=none | c=confirm"
 end
 
-sudo pacman -Syu --needed --noconfirm base-devel dkms git curl $KERNEL_HEADERS python-pip
-
-# 3. Kernel Module (Linuwu-Sense) via DKMS
-log "Setting up $MODULE_NAME via DKMS..."
-set SRC_DIR "/usr/src/linuwu-sense-1.0"
-sudo rm -rf $SRC_DIR
-sudo git clone $REPO_DRIVER $SRC_DIR
-
-# Determine Compiler Flags
-set MAKE_FLAGS ""
-if grep -q "clang" /proc/version
-    log "Clang kernel detected. Using LLVM flags."
-    set MAKE_FLAGS "LLVM=1 CC=clang"
+function init_selections
+    set -g MODULE_SELECTED
+    for i in (seq (count $MODULE_IDS))
+        set -l id $MODULE_IDS[$i]
+        if is_in_list "$id" $RECOMMENDED_MODULES
+            set -a MODULE_SELECTED 1
+        else
+            set -a MODULE_SELECTED 0
+        end
+    end
 end
 
-# Create DKMS Config
-sudo tee $SRC_DIR/dkms.conf > /dev/null <<EOF
-PACKAGE_NAME="linuwu-sense"
-PACKAGE_VERSION="1.0"
-CLEAN="make clean"
-MAKE[0]="make KVERSION=\$kernelver $MAKE_FLAGS"
-BUILT_MODULE_NAME[0]="$MODULE_NAME"
-DEST_MODULE_LOCATION[0]="/kernel/drivers/platform/x86"
-AUTOINSTALL="yes"
-EOF
+function check_conflicts
+    # core-damx (#1) and thermal (#8) conflict (fish is 1-indexed)
+    if test "$MODULE_SELECTED[1]" = 1; and test "$MODULE_SELECTED[8]" = 1
+        warn "DAMX (Linuwu-Sense) and Kernel Thermal Profiles both selected."
+        warn "These conflict: Linuwu-Sense blacklists acer_wmi, which thermal profiles require."
+        warn "Please deselect one of them."
+        return 1
+    end
+    return 0
+end
 
-sudo dkms add -m linuwu-sense -v 1.0
-sudo dkms install -m linuwu-sense -v 1.0
+function run_menu
+    while true
+        display_menu
+        read -P "> " choice
 
-# Blacklist acer_wmi
-log "Blacklisting acer_wmi..."
-echo "blacklist acer_wmi" | sudo tee /etc/modprobe.d/blacklist-acer-wmi.conf > /dev/null
+        switch "$choice"
+            case 1 2 3 4 5 6 7 8
+                set -l idx $choice
+                if test "$MODULE_SELECTED[$idx]" = 1
+                    set MODULE_SELECTED[$idx] 0
+                else
+                    set MODULE_SELECTED[$idx] 1
+                end
+            case a A
+                init_selections
+            case n N
+                for i in (seq (count $MODULE_SELECTED))
+                    set MODULE_SELECTED[$i] 0
+                end
+            case c C
+                if check_conflicts
+                    break
+                end
+            case '*'
+                warn "Invalid input. Enter 1-"(count $MODULE_IDS)", a, n, or c."
+        end
+    end
+end
 
-# 4. DAMX GUI & Daemon Setup
-log "Fetching latest DAMX..."
-mkdir -p $INSTALL_DIR
-cd $INSTALL_DIR
+# --- Module execution ---
+function install_shared_deps
+    log "Installing shared system dependencies..."
+    run_sudo pacman -Syu --needed --noconfirm base-devel dkms git curl $KERNEL_HEADERS python-pip
+end
 
-set LATEST_RELEASE (curl -s https://api.github.com/repos/$REPO_APP/releases/latest | python3 -c "import sys, json; print(json.load(sys.stdin)['tag_name'])")
-log "Latest version found: $LATEST_RELEASE"
+function run_selected_modules
+    set -l selected_names
 
-set DL_URL "https://github.com/$REPO_APP/releases/download/$LATEST_RELEASE/DAMX-"(string replace "v" "" $LATEST_RELEASE)".tar.xz"
-curl -L $DL_URL -o damx.tar.xz
-tar -xf damx.tar.xz --strip-components=1
+    for i in (seq (count $MODULE_IDS))
+        if test "$MODULE_SELECTED[$i]" = 1
+            set -l id $MODULE_IDS[$i]
+            set -l label $MODULE_LABELS[$i]
+            set -a selected_names $id
 
-# Install Python deps safely
-pip install -r requirements.txt --break-system-packages > /dev/null 2>&1
+            section "Installing: $label"
+            source "$SCRIPT_DIR/modules/$id.fish"
+            module_install
+        end
+    end
 
-# 5. Systemd Service Setup
-log "Configuring systemd units..."
-set SERVICE_FILE "$HOME/.config/systemd/user/damx-daemon.service"
-mkdir -p (dirname $SERVICE_FILE)
+    # Write manifest
+    set -l modules_joined (string join " " $selected_names)
+    set -l files_joined (string join " " $INSTALLED_FILES)
+    set -l dkms_joined (string join " " $INSTALLED_DKMS)
+    set -l pkgs_joined (string join " " $INSTALLED_PACKAGES)
+    write_manifest "$modules_joined" "$files_joined" "$dkms_joined" "$pkgs_joined"
+end
 
-tee $SERVICE_FILE > /dev/null <<EOF
-[Unit]
-Description=DAMX Daemon - Fan & RGB Manager
-After=graphical-session.target
+function verify_modules
+    section "Verification"
+    set -l total 0
+    set -l passed 0
 
-[Service]
-ExecStart=$INSTALL_DIR/DAMX.py --daemon
-Restart=on-failure
-Environment=PYTHONUNBUFFERED=1
+    for i in (seq (count $MODULE_IDS))
+        if test "$MODULE_SELECTED[$i]" = 1
+            set -l id $MODULE_IDS[$i]
+            set -l label $MODULE_LABELS[$i]
+            set total (math $total + 1)
 
-[Install]
-WantedBy=default.target
-EOF
+            source "$SCRIPT_DIR/modules/$id.fish"
+            if module_verify
+                success "$label"
+                set passed (math $passed + 1)
+            else
+                warn "$label (check warnings above)"
+            end
+        end
+    end
 
-systemctl --user daemon-reload
-systemctl --user enable --now damx-daemon.service
+    echo ""
+    log "Verification: $passed/$total modules passed"
+end
 
-log "Installation complete! \u2705"
-log "Check service status: systemctl --user status damx-daemon"
+# --- Main entry point ---
+function main
+    parse_args $argv
+
+    if test "$SHOW_VERSION" = 1
+        echo "Linuwu-DAMX Installer v$INSTALLER_VERSION"
+        exit 0
+    end
+    if test "$SHOW_HELP" = 1
+        show_help
+        exit 0
+    end
+
+    if test "$DRY_RUN" = 1
+        log "DRY RUN mode enabled. No changes will be made."
+    end
+
+    # Run hardware detection
+    log "Detecting hardware..."
+    detect_all
+    build_recommendations
+
+    # Vendor check
+    if not string match -q '*Acer*' "$ACER_SYS_VENDOR"; and test "$ACER_PRODUCT_NAME" = "Unknown"
+        warn "This does not appear to be an Acer system."
+        warn "Some modules may not function correctly."
+    end
+
+    # Distro check
+    if test "$DISTRO_FAMILY" != "arch"
+        warn "This installer is designed for Arch-based distributions."
+        warn "Detected: $DISTRO_NAME (family: $DISTRO_FAMILY)"
+        confirm "Continue anyway?"; or exit 0
+    end
+
+    # Initialize selections
+    init_selections
+
+    # Handle non-interactive modes
+    if test -n "$EXPLICIT_MODULES"
+        # Reset all, then select explicit modules
+        for i in (seq (count $MODULE_SELECTED))
+            set MODULE_SELECTED[$i] 0
+        end
+        for mod in (string split "," "$EXPLICIT_MODULES")
+            for i in (seq (count $MODULE_IDS))
+                if test "$MODULE_IDS[$i]" = "$mod"
+                    set MODULE_SELECTED[$i] 1
+                end
+            end
+        end
+        if not check_conflicts
+            error "Module conflict detected. Aborting."
+        end
+    else if test "$SELECT_ALL_RECOMMENDED" = 1
+        # Already initialized with recommendations
+    else
+        # Interactive menu
+        run_menu
+    end
+
+    # Count selected modules
+    set -l count 0
+    for sel in $MODULE_SELECTED
+        set count (math $count + $sel)
+    end
+    if test $count -eq 0
+        log "No modules selected. Nothing to install."
+        exit 0
+    end
+
+    # Display selected modules
+    section "Installation Plan"
+    for i in (seq (count $MODULE_IDS))
+        if test "$MODULE_SELECTED[$i]" = 1
+            echo "  - $MODULE_LABELS[$i]"
+        end
+    end
+    echo ""
+
+    if test "$NO_CONFIRM" = 0; and test "$SELECT_ALL_RECOMMENDED" = 0; and test -z "$EXPLICIT_MODULES"
+        confirm "Proceed with installation?"; or exit 0
+    end
+
+    # Install shared dependencies
+    install_shared_deps
+
+    # Run selected modules
+    run_selected_modules
+
+    # Verify
+    verify_modules
+
+    # Final summary
+    section "Installation Complete"
+    success "All selected modules have been installed."
+
+    if test "$REBOOT_REQUIRED" = 1
+        echo ""
+        warn "A reboot is required for some changes to take effect."
+    end
+
+    echo ""
+    log "Manifest saved to: $MANIFEST_FILE"
+    log "To uninstall, run: ./uninstall.fish"
+end
+
+main $argv
